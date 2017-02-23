@@ -1,0 +1,6 @@
+# still incomplete
+django-extensions
+django-celery
+djangorestframework
+djangorestframework-filters
+pika

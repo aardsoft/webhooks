@@ -1,0 +1,8 @@
+<?xml version="1.0"?>
+<process name="buildsuccess">
+    <sequence>
+        <action participant="webhook_launcher.tasks.dump" />
+        <action participant="autodoc.tasks.deploy" />
+        <action participant="data_analysis.slurp" />
+    </sequence>
+</process>

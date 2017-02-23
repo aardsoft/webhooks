@@ -1,0 +1,10 @@
+<?xml version="1.0"?>
+<process name="buildsuccess">
+    <sequence>
+        <action participant="webhook_launcher.tasks.dump" />
+        <action participant="webhook_launcher.tasks.accept_request" />
+        <action participant="webhook_launcher.tasks.check_build_results" />
+        <action participant="testing.jfdi" />
+        <action participant="testing_rmz.jfdi" />
+    </sequence>
+</process>

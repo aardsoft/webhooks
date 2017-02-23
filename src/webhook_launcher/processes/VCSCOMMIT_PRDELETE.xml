@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<process name="prmerge">
+    <sequence>
+      <action participant="webhook_launcher.tasks.delete_branch" />
+    </sequence>
+</process>

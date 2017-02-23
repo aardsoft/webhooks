@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<process name="vcsbuild">
+    <context>
+      <property name="state" type="str">ok</property>
+      <property name="eventtype" type="str">VCSCOMMIT_REF</property>
+    </context>
+    <sequence>
+      <action participant="webhook_launcher.tasks.trigger_service" />
+      <action participant="webhook_launcher.tasks.get_merged_pr" />
+      <action participant="webhook_launcher.tasks.check_build_results" />
+      <action participant="autodoc.tasks.fancy_buildlog" />
+      <action participant="testing.jfdi" />
+      <action participant="testing_rmz.jfdi" />
+      <action participant="webhook_launcher.tasks.dump" />
+    </sequence>
+</process>

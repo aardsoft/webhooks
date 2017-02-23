@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<process name="vcsbuild">
+    <context>
+      <property name="state" type="str">ok</property>
+      <property name="eventtype" type="str">VCSCOMMIT_REVIEW</property>
+    </context>
+    <sequence>
+      <action participant="webhook_launcher.tasks.create_branch" />
+      <action participant="webhook_launcher.tasks.trigger_service" />
+      <action participant="webhook_launcher.tasks.enable_branch" />
+      <action participant="webhook_launcher.tasks.check_build_results" />
+      <action participant="webhook_launcher.tasks.disable_branch" />
+      <action participant="autodoc.tasks.fancy_buildlog" />
+      <action participant="webhook_launcher.tasks.pr_vote" />
+      <switch>
+        <case>
+          <condition>context["state"] == "fail"</condition>
+          <action participant="webhook_launcher.tasks.dump" />
+          <fault code="Failed" message="Process failed, aborting." />
+        </case>
+        <case>
+          <condition>True</condition>
+          <action participant="testing.jfdi" />
+          <action participant="webhook_launcher.tasks.pr_vote" />
+          <action participant="webhook_launcher.tasks.dump" />
+        </case>
+      </switch>
+    </sequence>
+</process>
