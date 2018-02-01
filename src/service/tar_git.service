@@ -17,8 +17,21 @@
   <parameter name="debian">
     <description>Also generate debian packaging from a debian subdir if available (Y/N)</description>
   </parameter>
-  <parameter name="dumb">
-    <description>Take content of revision as-is without automatic processing (Y/N)</description>
+  <parameter name="dumb"></parameter>
+  <parameter name="manifest">
+    <description>Name of a manifest.xml in the repo</description>
+  </parameter>
+  <parameter name="bitbake">
+    <description>turn on bitbake handling</description>
+  </parameter>
+  <parameter name="distro">
+    <description>bitbake distro</description>
+  </parameter>
+  <parameter name="machine">
+    <description>bitbake machine</description>
+  </parameter>
+  <parameter name="pin">
+    <description>Set revisions of related repositories</description>
   </parameter>
 </service>
 

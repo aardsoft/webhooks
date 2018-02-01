@@ -1,0 +1,129 @@
+#!/bin/bash
+# Copyright (C) 2013 Jolla Ltd.
+# Contact: Islam Amer <islam.amer@jollamobile.com>
+# All rights reserved.
+# 
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+# 
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# 
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+
+exec 1>&2
+set -e
+
+#export LANG=en_US.utf8
+#export LC_CTYPE="en_US.utf8"
+#export LC_ALL=
+export GREP_COLORS=never
+
+if [ -f /etc/sysconfig/proxy ]; then
+  source /etc/sysconfig/proxy
+  export http_proxy=$HTTP_PROXY
+  export https_proxy=$HTTPS_PROXY
+  export no_proxy=$NO_PROXY
+  export GIT_PROXY_COMMAND
+fi
+
+parse_url () {
+
+  # parse git URLs of various forms:
+  # ssh://[user@]host.xz[:port]/path/to/repo.git/
+  # git://host.xz[:port]/path/to/repo.git/
+  # http[s]://host.xz[:port]/path/to/repo.git/
+  # ftp[s]://host.xz[:port]/path/to/repo.git/
+  # rsync://host.xz/path/to/repo.git/
+  # [user@]host.xz:path/to/repo.git/
+
+  # remove possible trailing slash
+  TEMP_URL="${SOURCE%/}"
+  # remove possible trailing .git
+  TEMP_URL="${TEMP_URL%.git}"
+  # extract git repo name
+  REPO_NAME="${TEMP_URL##*/}"
+  # remove repo name from url
+  TEMP_URL="${TEMP_URL%/$REPO_NAME}"
+  # extract possible scheme from url
+  SCHEME="${TEMP_URL%://*}"
+  # remove possible scheme from url
+  TEMP_URL="${TEMP_URL#*://}"
+  if test "$SCHEME" = "$TEMP_URL"; then
+    # no scheme
+    SCHEME="ssh"
+    REPO_PATH="${TEMP_URL#*:}"
+    REPO_URL="${TEMP_URL%:$REPO_PATH}"
+  else
+    REPO_PATH="${TEMP_URL#*/}"
+    REPO_URL="${TEMP_URL%/$REPO_PATH}"
+  fi
+  # remove possible username / password
+  REPO_URL="${REPO_URL##*@}"
+  # remove possible port
+  REPO_URL="${REPO_URL%:*}"
+  # extract service name
+  SVC_NAME="${REPO_URL%.*}"
+  SVC_NAME="${SVC_NAME#*.}"
+  CLONE_NAME="$REPO_NAME"
+
+}
+
+cache_prefetch () {
+
+  if [ ! -d $CACHE_DIR ]; then
+      mkdir -p $CACHE_DIR || error "$CACHE_DIR doesn't exist ..."
+  fi
+
+  SERVER_SUBDIR="$(dirname $SOURCE)"
+  [[ "$SERVER_SUBDIR" = "." ]] && SERVER_SUBDIR=$SOURCE
+  
+  SERVER_DIR="$CACHE_DIR/$(echo $SERVER_SUBDIR | sed -e 's/\//_/g' -e 's/:/_/g')"
+  mkdir -p "$SERVER_DIR"
+  CLONE_DIR="$SERVER_DIR/$CLONE_NAME"
+
+  if test \! -d "$CLONE_DIR"; then
+      mkdir -p "$CLONE_DIR"
+      pushd "$CLONE_DIR" >/dev/null
+          flock -w 7200 -x "$CLONE_DIR" git clone -q --mirror "$SOURCE" . 
+      popd >/dev/null
+  fi
+
+  pushd "$CLONE_DIR" >/dev/null
+      flock -w 7200 -x "$CLONE_DIR" git fetch -q --prune --force origin $REFSPECS
+  popd >/dev/null
+
+}
+
+mirror () {
+
+  pushd "$CLONE_DIR" >/dev/null
+      git push --verbose --tags --prune "$TARGET" $REFSPECS
+  popd >/dev/null
+
+}
+
+main () {
+  CACHE_DIR="/data/cache/tar_git"
+  SOURCE="$1"
+  shift
+  TARGET="$1"
+  shift
+  REFSPECS="$@"
+  CLONE_NAME=""
+  CLONE_DIR=""
+
+  parse_url
+  cache_prefetch
+  mirror
+}
+
+main "$@"
+
+exit 0

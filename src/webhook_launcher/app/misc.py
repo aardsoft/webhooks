@@ -3,6 +3,8 @@ import urlparse
 import pycurl
 import json
 
+from pygerrit.client import GerritClient
+
 def giturlparse(repourl):
     parsed = urlparse.urlparse(repourl)
     if not parsed.scheme:
@@ -64,3 +66,17 @@ class bbAPIcall(object):
         self.api_call('repositories', 'branches-tags')
         return json.loads(self.contents)
 
+def getGerritChange(gerrit_url, cid):
+    parsed_netloc = giturlparse(gerrit_url)
+    gerrit = GerritClient(host=parsed_netloc.netloc, port=parsed_netloc.port, keepalive=5)
+    try:
+        result = gerrit.run_command("query %s --current-patch-set --format=JSON" % cid)
+        resstdout = result.stdout.read()
+        if resstdout:
+            change = json.loads(resstdout.splitlines()[0])
+            if change.get("type", None):
+                return None
+
+            return change
+    except Exception, exc:
+        return None

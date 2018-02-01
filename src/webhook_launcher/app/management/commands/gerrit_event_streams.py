@@ -19,38 +19,37 @@ def connect(inst):
         except Exception, e:
             print "%s error try %s" % (e, i)
         time.sleep(2)
-    raise RuntimeError("Gave up connecting")
+    return None
     
 def listen_streams():
     gerrit_instances = {}
-    for inst in VCSService.objects.filter(gerrit=True):
-        try:
-            gerrit = connect(inst)
-            gerrit_instances[inst] = gerrit
-        except Exception, e:
-            print e, "connecting to Gerrit", inst.netloc
-
     while True:
         sys.stdout.flush()
-        for inst, gerrit in gerrit_instances.items():
+        for inst in VCSService.objects.filter(gerrit=True):
+            gerrit = gerrit_instances.get(inst)
+            if gerrit is None:
+                print "Connecting to %s" % inst.netloc
+                gerrit_instances[inst] = connect(inst)
+                continue
+
             event = None
-            event = gerrit.get_event(block=True, timeout=1)
+            try:
+                event = gerrit.get_event(block=True, timeout=1)
+            except Exception, e:
+                print "Error %s getting event from %s" % (e, inst.netloc)
+                gerrit_instances[inst] = None
+                continue
+
             if event is not None:
                 data = event.json
                 print "Got %s" % data
                 if data.get("type", "") == "error-event":
-                    print "Reconnecting to %s" % inst.netloc
                     gerrit.stop_event_stream()
-                    try:
-                        connect(inst)
-                    except RuntimeError, exc:
-                        # put back error event so we hopefully try again later
-                        gerrit.put_event(data)
+                    gerrit_instances[inst] = None 
                 else:
                     data["gerrit"] = inst.netloc 
+                    data["vcsname"] = inst.name
                     launch_queue({"payload" : data})
-            #else:
-            #    print "%s %s" % (inst.netloc, gerrit.gerrit_version())
 
 class Command(BaseCommand):
     def handle(self, *args, **options):

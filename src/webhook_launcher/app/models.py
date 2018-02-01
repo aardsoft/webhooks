@@ -105,8 +105,8 @@ class Project(models.Model):
     official = models.BooleanField(default=True, help_text="If set then only valid namespaces can be used for the git repo")
     allowed = models.BooleanField(default=True, help_text="If not set then webhooks are not allowed for this project. This is useful for projects which should only have specific versions of packages promoted to them.")
     gated = models.BooleanField(default=False, help_text="If set then webhooks pointing at this project will be triggered to a side project instead and then an autopromotion attempted. This is useful for projects which apply formal entry checks and/or QA.")
-    groups = models.ManyToManyField(Group, blank=True)
-    vcsnamespaces = models.ManyToManyField(VCSNameSpace, blank=True)
+    groups = models.ManyToManyField(Group, blank=True, null=True)
+    vcsnamespaces = models.ManyToManyField(VCSNameSpace, blank=True, null=True)
     match = models.CharField(max_length=250, blank=True, null=True, help_text="If set then used as well as name to re.match() project names")
 
 class WebHookMapping(models.Model):
@@ -114,6 +114,9 @@ class WebHookMapping(models.Model):
     def __unicode__(self):
         rev = " @ " + (self.revision or "")
         return "%s/%s -> %s/%s%s" % (self.repourl, self.branch, self.project, self.package, rev)
+
+    class Meta(object):
+        ordering = ('pk', )
 
     @property
     def tag(self):
@@ -219,6 +222,7 @@ class WebHookMapping(models.Model):
         fields['revision'] = self.revision
         fields['tag'] = self.tag
         fields['slaves'] = [sl.to_fields() for sl in self.slaves.all()]
+        fields['mirrors'] = [mirror.to_fields() for mirror in self.mirror_set.all()]
         return fields
 
     # If any fields are added/removed then ensure they are handled
@@ -235,6 +239,8 @@ class WebHookMapping(models.Model):
     pr_voting = models.BooleanField(default=True, help_text="Enable pull request voting")
     manifest = models.CharField(max_length=256, default="", null=True, blank=True, help_text="The name of an XML repo manifest file to be used in fetching sources")
     bitbake = models.CharField(max_length=256, default="", null=True, blank=True, help_text="The name of a bitbake image name to be prefetched and handled")
+    distro = models.CharField(max_length=256, default="", null=True, blank=True, help_text="The name of bitbake distro used in prefetching and building")
+    machine = models.CharField(max_length=256, default="", null=True, blank=True, help_text="The name of bitbake machine used in prefetching and building")
     masters = models.ManyToManyField("self", blank=True, related_name="slaves", symmetrical=False, help_text="Link this hook to others that will be triggered instead")
     obs = models.ForeignKey(BuildService)
     debian = models.CharField(max_length=2, default="", null=True, blank=True, choices = (('N','N'),('Y','Y')), help_text="Choose Y to turn on debian packaging support")
@@ -255,6 +261,39 @@ class LastSeenRevision(models.Model):
     emails = models.TextField(blank=True, null=True, editable=False)
     payload = models.TextField(blank=True, null=True, editable=False)
 
+class Mirror(models.Model):
+
+    def __unicode__(self):
+        return str(self.source.repourl) + " to " + str(self.target)
+
+    def clean(self, exclude=None):
+        if not self.name:
+            url = giturlparse(self.source.repourl)
+            self.name = os.path.basename(url.path)
+
+        if not self.refspecs:
+            self.refspecs = self.source.branch
+        self.refspecs = " ".join(self.refspecs.splitlines())
+
+    def to_fields(self):
+        target = str(self.target)
+        if target[-1] != "/":
+            target = target + "/"
+        target = target + self.name
+
+        mirror = {"source" : self.source.repourl,
+                  "target" : target,
+                  "refspecs" : self.refspecs,}
+        return mirror
+
+    source = models.ForeignKey(WebHookMapping)
+    target = models.ForeignKey(VCSNameSpace)
+    name = models.CharField(max_length=256, default="", null=True, blank=True)
+    refspecs = models.TextField(blank=True, null=True)
+    log = models.TextField(blank=True, null=True, editable=False)
+    uptodate = models.BooleanField(default=False, editable=False)
+    updated = models.DateTimeField(auto_now=True)
+    
 class QueuePeriod(models.Model):
 
     def __unicode__(self):
@@ -290,8 +329,8 @@ class QueuePeriod(models.Model):
 
         return True
 
-    start_time = models.TimeField(default=datetime.datetime.now())
-    end_time = models.TimeField(default=datetime.datetime.now())
+    start_time = models.TimeField(default=datetime.datetime.now)
+    end_time = models.TimeField(default=datetime.datetime.now)
     start_date = models.DateField(blank=True, null=True)
     end_date = models.DateField(blank=True, null=True)
     recurring = models.BooleanField(default=False)

@@ -99,6 +99,7 @@ VCSCOMMIT_NOTIFY = config.get('processes', 'vcscommit_notify')
 VCSCOMMIT_BUILD = config.get('processes', 'vcscommit_build')
 VCSCOMMIT_PRVOTE = config.get('processes', 'vcscommit_prvote')
 VCSCOMMIT_PRDELETE = config.get('processes', 'vcscommit_prdelete')
+VCSCOMMIT_MIRROR = config.get('processes', 'vcscommit_mirror')
 
 
 USE_LDAP = config.getboolean('ldap', 'use_ldap')
@@ -135,13 +136,14 @@ if config.has_option('web', 'strict_mappings'):
     STRICT_MAPPINGS = config.getboolean('web', 'strict_mappings')
 
 DEBUG = True
+TEMPLATE_DEBUG = DEBUG
 
 ADMINS = (
     # ('Your Name', 'your_email@domain.com'),
-    ('Islam Amer', 'islam.amer@ge.com'),
+    ('Islam Amer', 'admin@localhost'),
 )
 
-EMAIL_HOST = "mail.ge.com"
+EMAIL_HOST = "localhost"
 
 MANAGERS = ADMINS
 DATABASES = {

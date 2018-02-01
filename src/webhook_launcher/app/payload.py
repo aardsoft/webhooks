@@ -27,8 +27,9 @@ import os
 from webhook_launcher.app.models import (WebHookMapping, LastSeenRevision, RelayTarget, Project, VCSNameSpace, BuildService)
 
 from webhook_launcher.app.tasks import trigger_build 
-from webhook_launcher.app.bureaucrat import launch_notify, launch_build, launch_pr_voting, launch_pr_delete
+from webhook_launcher.app.bureaucrat import launch_notify, launch_build, launch_pr_voting, launch_pr_delete, launch_mirror
 from webhook_launcher.app.misc import bbAPIcall
+from webhook_launcher.app.misc import getGerritChange
 
 def get_payload(data):
     """ payload factory function hides the messy details of detecting payload type """
@@ -62,7 +63,7 @@ def get_payload(data):
 
     elif gerrit:
         event_type = data["type"]
-        if event_type in ["patchset-created", "change-restored", "change-abandoned", "change-merged", "comment-added", "reviewer-added", "draft-published"]:
+        if event_type in ["patchset-created", "change-restored", "change-abandoned", "change-merged", "comment-added", "reviewer-added", "draft-published", "topic-changed"]:
             url = data["gerrit"] + '/' + data["change"]["project"]
             klass = GerritPull
         elif event_type == "ref-updated":
@@ -136,12 +137,12 @@ class Payload(object):
         lsr.handled = False
         lsr.save()
     
-        message = "%s commit(s) pushed by %s to %s branch of %s" % (len(lsr.payload["commits"]), user, mapobj.branch, mapobj.repourl)
-        if not mapobj.mapped:
-            message = "%s, which is not mapped yet. Please map it." % message
+        #message = "%s commit(s) pushed by %s to %s branch of %s" % (len(lsr.payload["commits"]), user, mapobj.branch, mapobj.repourl)
+        #if not mapobj.mapped:
+        #    message = "%s, which is not mapped yet. Please map it." % message
     
         fields = mapobj.to_fields()
-        fields['msg'] = message
+        #fields['msg'] = message
         fields['payload'] = lsr.payload
 
         if mapobj.notify:
@@ -149,17 +150,22 @@ class Payload(object):
 
         if mapobj.build_head:
             trigger_build(mapobj, user, lsr=lsr)
+
+        if mapobj.mirror_set.count():
+            _ = mapobj.mirror_set.update(uptodate=False)
+            launch_mirror(fields)
     
-    def handle_pr(self, mapobj, pr, action="create", slave=None):
- 
+    def handle_pr(self, mapobj, pr, action="create", slave=None, voter=int(True)):
+
         if mapobj.masters.count() and slave is None:
             for master in mapobj.masters.all():
-                self.handle_pr(master, pr, action=action, slave=mapobj)
+                self.handle_pr(master, pr, action=action, slave=mapobj, voter=voter)
             return
 
         fields = mapobj.to_fields()
         fields['payload'] = self.data
         fields['pr'] = pr
+        fields['voter'] = voter
         if slave is None:
             fields['branch'] = pr['source_branch']
             fields['repourl'] = pr['source_repourl']
@@ -180,9 +186,9 @@ class Payload(object):
         if mapobj.notify:
             launch_notify(fields)
 
-        if action == "create" and mapobj.mapped and mapobj.pr_voting:
+        if action == "create":
             launch_pr_voting(fields)
-        elif action == "delete" and mapobj.mapped and mapobj.pr_voting:
+        elif action == "delete":
             launch_pr_delete(fields)
 
     def relay(self, relays=None):
@@ -239,30 +245,65 @@ class GerritPull(Payload):
         payload = self.data
         repourl = self.url
         action = "create"
+        if payload["type"] in ["change-abandoned", "change-merged"]:
+            action = "delete"
+
+        if payload["type"] == "reviewer-added":
+            reviewer = payload["reviewer"]["username"]
+            return
+
+        if payload["type"] in ["comment-added"]:#, "change-restored"]:
+            comment = payload.get("comment", "").lower()
+            if not "trigger" in comment or not "@ci" in comment:
+                return
+
+        if payload["type"] == "topic-changed":
+            fullchange = getGerritChange(payload["gerrit"], payload["change"]["number"])
+            if fullchange:
+                payload["change"] = fullchange
+                payload["patchSet"] = fullchange["currentPatchSet"]
+                self.data = payload
+            else:
+                return
+
+        if payload["patchSet"].get("isDraft", False):
+            return
 
         branch = payload["change"]["branch"]
+        mappings = WebHookMapping.objects.filter(repourl=repourl, branch=branch)
+
         pr = { "url" : payload["change"]["url"],
                "source_repourl" : repourl,
                "source_project" : payload["change"]["project"],
                "source_branch" : payload["patchSet"]["ref"],
+               "target_branch" : branch,
                "revision" : payload["patchSet"]["revision"],
                "username" : payload["change"]["owner"]["username"],
                "action" : payload['type'].replace("-", " "),
                "id" : "%s:%s" % (payload['change']['number'], payload['patchSet']['number']),
                "gerrit_id" : payload['change']['id'],
                "subject" : payload['change']['subject'],
+               "vcsname" : payload["vcsname"],
               }
 
-        if payload["type"] in ["comment-added"]:#, "change-restored"]:
-            return
-        elif payload["type"] == "reviewer-added":
-            reviewer = payload["reviewer"]["username"]
-            return
-        elif payload["type"] in ["change-abandoned", "change-merged"]:
-            action = "delete"
+        if payload['change'].get('topic', None):
+            pr["topic"] = payload['change']['topic']
+            pr["topicurl"] = pr["url"].replace(payload['change']['number'], "#/q/topic:%s" % pr["topic"])
 
-        for mapobj in WebHookMapping.objects.filter(repourl=repourl, branch=branch):
-            self.handle_pr(mapobj, pr, action=action)
+        for mapobj in mappings:
+            if mapobj.mapped and mapobj.pr_voting:
+                pr["builds"] = [othermap.package for othermap in mappings if othermap.mapped and othermap.pr_voting and mapobj.project == othermap.project]
+                self.handle_pr(mapobj, pr, action=action, voter=int(pr["builds"][0] == mapobj.package))
+
+        if payload["type"] == "topic-changed":
+            action = "delete"
+            pr["topic"] = payload['oldTopic']
+            pr["topicurl"] = pr["url"].replace(payload['change']['number'], "#/q/topic:%s" % pr["topic"])
+
+            for mapobj in mappings:
+                if mapobj.mapped and mapobj.pr_voting:
+                    pr["builds"] = [othermap.package for othermap in mappings if othermap.mapped and othermap.pr_voting and mapobj.project == othermap.project]
+                    self.handle_pr(mapobj, pr, action=action, voter=int(pr["builds"][0] == mapobj.package))
 
 class GerritPush(Payload):
 
@@ -332,7 +373,9 @@ class GerritPush(Payload):
                 if emails:
                     seenrev.emails = json.dumps(list(emails))
 
-                trigger_build(mapobj, name, lsr=seenrev, tag=refname)
+                self.handle_commit(mapobj, seenrev, name, notify=mapobj.notify and not notified)
+                notified = True
+                #trigger_build(mapobj, name, lsr=seenrev, tag=refname)
 
 class GhPull(Payload):
 

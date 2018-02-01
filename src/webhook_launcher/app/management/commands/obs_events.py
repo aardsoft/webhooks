@@ -20,7 +20,7 @@ app.conf.update(
     CELERYD_PREFETCH_MULTIPLIER = 1,
     CELERY_SEND_TASK_ERROR_EMAILS = True,
     SERVER_EMAIL = "celery@webhooks-docker",
-    EMAIL_HOST = "mail.ge.com",
+    EMAIL_HOST = "localhost",
 )
 
 class MyConsumerStep(bootsteps.ConsumerStep):

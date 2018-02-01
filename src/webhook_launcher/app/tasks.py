@@ -18,8 +18,10 @@
 
 import json
 
+from django.db.models import Q
+
 from webhook_launcher.app.models import (LastSeenRevision, QueuePeriod)
-from webhook_launcher.app.bureaucrat import launch_notify, launch_build
+from webhook_launcher.app.bureaucrat import launch_notify, launch_build, launch_mirror
 
 def trigger_build(mapobj, user, lsr=None, tag=None, force=False, master=None):
 
@@ -61,9 +63,9 @@ def trigger_build(mapobj, user, lsr=None, tag=None, force=False, master=None):
                 delayed = True
                 break
 
-        if mapobj.masters.count() and master is None:
+        if mapobj.masters.filter(Q(build_head=True) or Q(build_tag=True)).count() and master is None:
             lsr.save()
-            for master in mapobj.masters.all():
+            for master in mapobj.masters.filter(Q(build_head=True) or Q(build_tag=True)):
                 trigger_build(mapobj, user, lsr=lsr, tag=tag, force=force, master=master)
             lsr.handled = True
             lsr.save()
@@ -125,3 +127,5 @@ def trigger_build(mapobj, user, lsr=None, tag=None, force=False, master=None):
  
     return message
 
+def trigger_mirror(payload):
+    launch_mirror(payload)

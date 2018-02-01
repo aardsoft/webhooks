@@ -31,3 +31,6 @@ def launch_pr_voting(fields):
 
 def launch_pr_delete(fields):
     launch(settings.VCSCOMMIT_PRDELETE, fields)
+
+def launch_mirror(fields):
+    launch(settings.VCSCOMMIT_MIRROR, fields)

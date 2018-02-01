@@ -28,9 +28,9 @@ from django.conf import settings
 from webhook_launcher.app.models import (LastSeenRevision, WebHookMapping, 
                                          BuildService, Project, VCSService,
                                          VCSNameSpace, QueuePeriod,
-                                         RelayTarget)
+                                         RelayTarget, Mirror)
 
-from webhook_launcher.app.tasks import trigger_build
+from webhook_launcher.app.tasks import trigger_build, trigger_mirror
 from webhook_launcher.app.misc import get_or_none
 from webhook_launcher.app.payload import get_payload
 
@@ -40,6 +40,11 @@ class SlavesThrough(WebHookMapping.slaves.through):
 
     def __unicode__(self):
         return ""
+
+class MirrorsInline(admin.StackedInline):
+    model = Mirror
+    extra = 0
+    readonly_fields = ('log', 'uptodate', 'updated',)
 
 class SlavesInline(admin.TabularInline):
     model = SlavesThrough
@@ -71,14 +76,14 @@ class WebHookMappingAdmin(admin.ModelAdmin):
     fieldsets = (
                  (None, {'fields': ('repourl', 'branch', 'project', 'package')}),
                  ("Triggers", {'fields': (('notify', 'build_head', 'build_tag', 'pr_voting'),)}),
-                 ("Advanced options", {'fields': ('manifest', 'bitbake', 'masters', 'obs'), 'classes': ('collapse',)}),
+                 ("Advanced options", {'fields': ('manifest', 'bitbake', 'distro', 'machine', 'masters', 'obs'), 'classes': ('collapse',)}),
                  ("Other options", {'fields': ('debian', 'dumb', 'comment'), 'classes': ('collapse',)})
                 )
     list_display = ( 'repourl', 'branch', 'project', 'package', 'notify', 'build_head')
     list_display_links = ( 'repourl', )
     list_filter = ( 'project', 'user', 'notify', 'build_head' )
     search_fields = ( 'user__username', 'user__email', 'repourl', 'project', 'package' )
-    inlines = [LastSeenRevisionInline, SlavesInline]
+    inlines = [LastSeenRevisionInline, MirrorsInline, SlavesInline]
     actions = ['trigger_build']
     formfield_overrides = { models.CharField: {'widget' : TextInput(attrs={ 'size' : '100' })}, }
     save_on_top = True
@@ -140,6 +145,19 @@ class WebHookMappingAdmin(admin.ModelAdmin):
 class BuildServiceAdmin(admin.ModelAdmin):
     pass
 
+class MirrorAdmin(admin.ModelAdmin):
+    readonly_fields = ('log', 'uptodate', 'updated',)
+    list_display = ('__unicode__', 'updated', 'uptodate')
+    list_filter = ('uptodate',)
+    raw_id_fields = ('source',)
+    actions = ['update']
+
+    def update(self, request, mirrors):
+        for mirrorobj in mirrors:
+            data={}
+            data["mirrors"] = [mirrorobj.to_fields()]
+            trigger_mirror(data)
+
 class LastSeenRevisionAdmin(admin.ModelAdmin):
     readonly_fields = ("timestamp",)
 
@@ -187,3 +205,4 @@ admin.site.register(VCSNameSpace)
 admin.site.register(VCSService)
 admin.site.register(QueuePeriod, QueuePeriodAdmin)
 admin.site.register(RelayTarget, RelayTargetAdmin)
+admin.site.register(Mirror, MirrorAdmin)

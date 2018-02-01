@@ -16,6 +16,10 @@
 # You should have received a copy of the GNU General Public License
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+
+exec 1>&2
+echo "$@"
+
 export LANG=en_US.utf8
 export LC_CTYPE="en_US.utf8"
 export LC_ALL=
@@ -26,10 +30,13 @@ if [ -f /etc/sysconfig/proxy ]; then
   export http_proxy=$HTTP_PROXY
   export https_proxy=$HTTPS_PROXY
   export no_proxy=$NO_PROXY
+  export GIT_PROXY_COMMAND
 fi
 
 SERVICE='tar_git'
-CACHEDIR=''
+CACHE_DIR=''
+CACHE_DIR_YOCTO=''
+SITE_CONF_YOCTO=''
 
 set_default_params () {
   MYURL=""
@@ -56,6 +63,7 @@ get_config_options () {
   if [ -f "$HOME"/.obs/$SERVICE ]; then
     . "$HOME"/.obs/$SERVICE
   fi
+  export CACHE_DIR CACHE_DIR_YOCTO SITE_CONF_YOCTO
 }
 
 usage () {
@@ -68,6 +76,11 @@ usage () {
     echo '	--debian	Y/N switch to turn on debian packaging support (defaults to N)'
     echo '	--fileserver    baseurl of a location for fetching files listed in a _sources file in the rpm subdir'
     echo '	--dumb          Y/N switch to take content of revision as-is without automatic processing'
+    echo '	--manifest      check for a specific manifest file name and process it with repo tool'
+    echo '	--bitbake       run bitbake fetchall for this image using bblayers.conf and local.conf from packaging'
+    echo '	--distro        run bitbake fetchall with this distro setting'
+    echo '	--machine       run bitbake fetchall with this machine setting'
+    echo '	--pin           set revision of related repositories (for bitbake recipes and repo manifest, [name]:[revision])'
     echo 'If your git repo has multiple spec files in the rpm subdirectory set the env variable OBS_SERVICE_PACKAGE '
     echo 'to the name of the one you want to use (without .spec suffix)'
     echo 'The _sources file is expected to contain lines of <sha1sum> <subdir>/<filename>'
@@ -101,12 +114,32 @@ parse_params () {
         DUMB="$2"
         shift
       ;;
+      *-manifest)
+        MANIFEST="$2"
+        shift
+      ;;
+      *-bitbake)
+        BITBAKE="$2"
+        shift
+      ;;
+      *-distro)
+        DISTRO="$2"
+        shift
+      ;;
+      *-machine)
+        MACHINE="$2"
+        shift
+      ;;
       *-debian)
         DEBIAN="$2"
         shift
       ;;
       *-fileserver)
         FILESERVER="$2"
+        shift
+      ;;
+      *-pin)
+        PINS="$2 $PINS"
         shift
       ;;
       *-help)
@@ -198,40 +231,33 @@ sanitise_params () {
 
 find_spec_file () {
 
-  [[ -d "$1" ]] || error "no packaging in this git clone"
+  SPECFILE="$(find rpm/ packaging/ "$MYOUTDIR/.." -maxdepth 1 -xdev -type f -name '*.spec' 2>/dev/null)"
 
-  SPECFILE="$(find "$1"/ -maxdepth 1 -type f -name '*.spec')"
-
-  if [[ ! "$(echo $SPECFILE | wc -w)" -eq 1 ]]; then
-      SPECFILE=$(find "$1"/ -type f -name "$OBS_SERVICE_PACKAGE".spec)
+  if [[ "$(echo $SPECFILE | wc -w)" -gt 1 ]]; then
+      SPECFILE=$(find rpm/ packaging/ "$MYOUTDIR/.." -maxdepth 1 -xdev -type f -name "$OBS_SERVICE_PACKAGE".spec 2>/dev/null)
   fi
 
-  [[ "$(echo $SPECFILE | wc -w)" -eq 1 ]] || error "Need single spec file in rpm"
+  [[ "$(echo $SPECFILE | wc -w)" -eq 1 ]] || { echo "no spec file found"; return 1; }
+
+  cp -v "$SPECFILE" "$MYOUTDIR/"
+  SPECFILE="$(readlink -ne $MYOUTDIR/$(basename $SPECFILE))"
 
 }
 
 find_changes_file () {
 
-  CHANGESFILE="$(find $1 -type f -name '*.changes')"
+  CHANGESFILE="$(find rpm/ packaging/ "$MYOUTDIR/.." -maxdepth 1 -xdev -type f -name '*.changes' 2>/dev/null)"
 
   [[ "$(echo $CHANGESFILE | wc -w)" -le 1 ]] || error "Need single changes file in rpm"
 
-  [[ -z $CHANGESFILE ]] || cp "$CHANGESFILE" ..
-}
-
-find_yaml_file () {
-
-  YAMLFILE="$(basename $SPECFILE .spec).yaml"
-
-  [[ -f rpm/"$YAMLFILE" ]] && cp rpm/"$YAMLFILE" ..
-
+  [[ -z $CHANGESFILE ]] || cp -v "$CHANGESFILE" ..
 }
 
 find_other_files () {
 
-  for i in $(find rpm/ -type f -not -name '*.yaml' -not -name '*.changes' -not -name '*.spec'); do
+  for i in $(find rpm/ packaging/ "$MYOUTDIR/.." -maxdepth 1 -xdev -type f -not -name '*.changes' -not -name '*.spec' -not -name '_service' -not -name '.?*' 2>/dev/null); do
 
-    cp -v $i ..
+    cp -v $i $MYOUTDIR/
 
   done
 
@@ -245,6 +271,8 @@ get_spec_field() {
 }
 
 expand_spec_file() {
+
+  [[ -z $SPECFILE ]] && return
   local inc incfile
   grep -Po "^%include[[:space:]]+.*$" "$SPECFILE" | while read inc; do
     incfile="$( echo $inc | awk '{ print $2 }')"
@@ -258,8 +286,10 @@ d }" "$SPECFILE"
 
 find_package_name () {
 
-  PACKAGE_NAME="$(get_spec_field Name)"
-  [[ -z $PACKAGE_NAME ]] && error "couldn't determine package name from spec file"
+  [[ -z "$SPECFILE" ]] || PACKAGE_NAME="$(get_spec_field Name)"
+  [[ -n "$PACKAGE_NAME" ]] || PACKAGE_NAME="$OBS_SERVICE_PACKAGE"
+  [[ -n "$PACKAGE_NAME" ]] || PACKAGE_NAME="$CLONE_NAME"
+  [[ -z "$PACKAGE_NAME" ]] && error "couldn't determine package name from spec file or environment"
 
 }
 
@@ -312,12 +342,14 @@ resolve_spec_macro () {
 }
 
 find_version () {
-
-  VERSION="$(get_spec_field Version)"
-  [[ -z $VERSION ]] && error "couldn't determine version from spec file"
+  
+  [[ -z $SPECFILE ]] || VERSION="$(get_spec_field Version)"
+  [[ -z $VERSION ]] && { echo "couldn't determine version from spec file"; return 1; }
 }
 
 find_compression () {
+
+  [[ -z "$SPECFILE" ]] && { COMPRESS_COMMAND="gzip -n -1"; COMPRESS_EXT="tar.gz"; return 0; }
 
   SOURCE_FILENAME="$(get_spec_field Source)"
   [[ -z "$SOURCE_FILENAME" ]] && SOURCE_FILENAME="$(get_spec_field "Source[0-9]*")"
@@ -345,31 +377,11 @@ find_compression () {
   esac
 }
 
-get_list_of_tags () {
+get_tagver () {
 
-  fmt='
-    r=%(refname:short)
-    t=%(*objecttype)
-    if test "z$t" = z
-    then
-        d=%(committerdate:iso8601)
-    else
-        d=%(taggerdate:iso8601)
-    fi
-    d=$(date --date="$d" +%s)
-    echo "$d $r"
-  '
-  
-  eval=`git for-each-ref --shell --format="$fmt" refs/tags/`
-  list_of_tags=`eval "$eval" | sort -r | gawk '{print $2}' | xargs`
-
-}
-
-get_tagver_from_tag () {
+    local tag=$1 tagver
 
     if [ $(echo $tag | grep "/") ] ; then
-    # allow tags to have a prefix to allow vendor marking
-      tagprefix=$(echo $tag | cut -f1 -d'/')
       tagver=$(echo $tag | cut -f2 -d'/')
     # some people like to prefix versions with a v
     elif [ $(echo $tag | grep -Po "^v") ]; then
@@ -378,15 +390,11 @@ get_tagver_from_tag () {
       tagver=$tag
     fi
 
-    CHANGELOGVER="${tagver}"
     if [ $(echo $tagver | grep -Po "\-[a-zA-Z0-9]+?$") ] ; then
-    # allow using a -XXXX suffix for release field
-      tagsuffix=$(echo $tagver | cut -f2 -d'-')
       tagver=$(echo $tagver | cut -f1 -d'-')
-      RELEASE=$tagprefix$tagsuffix
-      CHANGELOGVER="${tagver}-${RELEASE}"
     fi
 
+    echo $tagver
 }
 
 is_valid_tagver () {
@@ -402,218 +410,69 @@ is_valid_tagver () {
 
 }
 
-find_version_tag () {
-
-  list_of_tags=""
-
-  get_list_of_tags
-  filter_list_of_tags
-
-  for tag in $list_of_tags; do
-
-    tagver=""
-
-    get_tagver_from_tag
-
-    if is_valid_tagver "$tagver" ; then
-      break
-    else
-      tagver=""
-      tag=""
-    fi
-  done
-
-  VERSION_FULLTAG="$tag"
-  VERSION="$tagver"
-
-}
-
 get_changes_header () {
 
-  local fmt='
-    r=%(refname:short)
-    t=%(*objecttype)
-    d=%(*committerdate:iso8601)
-    n=%(*authorname)
-    e=%(*authoremail)
-  
-    if test "z$t" = z
-    then
-            d=%(committerdate:iso8601)
-            n=%(authorname)
-            e=%(authoremail)
-    fi
-    d=$(date --date="$d" "+%a %b %d %Y")
-    echo "* $d $n $e - $CHANGELOGVER"
-  '
+  local ref=$1
 
-  local eval=`git for-each-ref --shell --format="$fmt" refs/tags/$tag`
-  local changes_header=`eval "$eval"`
-  echo "$changes_header"
+  eval $(git show --no-patch $ref --pretty=format:'local cI="%ci" an="%an" ae="%ae"')
+  local cd="$(date --date="$cI" '+%a %b %d %Y %H:%I %z')"
+  echo "* $cd $an <$ae> - $VERSHA"
 
-}
-
-filter_list_of_tags () {
-  # This function removes tags that are not pointing at refs that are in our branch of interest
-  # if a token is specified it also filters tags that don't contain a token
-
-  filtered_tags=""
-
-  for tag in $list_of_tags; do
-    
-    if [ ! -z "$TOKEN" ] && [ -z "$(echo $tag | grep -Fo $TOKEN)" ] ; then
-      continue
-    fi
-
-    contains="$( git branch --no-color --list --contains $tag $BRANCH )"
-
-    if [ ! -z "$contains" ]; then
-        filtered_tags="$filtered_tags $tag"
-    fi
-
-  done
-
-  list_of_tags="$filtered_tags"
-}
-
-get_tagmsg () {
-  tagtype=$(git for-each-ref --format="%(type)" refs/tags/$1)
-  if [ x"$tagtype" = x"commit" ]; then
-    echo "$(git for-each-ref --format='%(contents)' refs/tags/$1)"
-  fi
 }
 
 dash_trim () {
   # and workaround for github breaking the subject line with ... automatically
   # in pull requests
-  sed -e 's/^/- /' -e '/^\s*$/d' -e 's/JB#[0-9]\{1,\}\.\.\.$//'
+  sed -e '/^\s*$/d' -e 's/^/- /g' -e 's/^-\s*-/  -/g' -e 's/%/%%/g'
 }
 
 grep_entry () {
   grep -Po '^\[.+\].*$'
 }
 
-do_changelog_block () {
-
-    refrange="$tag"'..'"$prev_valid_tag"
-    ENTRIES="$(git log --pretty="%B" $refrange | grep_entry | grep -F "$TOKEN" | dash_trim | sort | uniq)"
-
-    tagmsg=""
-    prevtagmsg=""
-    tagged_entry=""
-    prevtagged_entry=""
-
-    tagged_entry="$(git log --pretty="%B" --no-walk $prev_valid_tag | grep_entry | dash_trim)"
-    tagmsg="$(get_tagmsg $prev_valid_tag | grep_entry | dash_trim)"
-
-    test -z "$tagged_entry" || ENTRIES="$tagged_entry"'\n'"$ENTRIES"
-
-    test -z "$prevtagged_entry" || ENTRIES="$prevtagged_entry"'\n'"$ENTRIES"
-
-    test -z "$prevtagmsg" || ENTRIES="$prevtagmsg"'\n'"$ENTRIES"
-
-    test -z "$tagmsg" || ENTRIES="$tagmsg"'\n'"$ENTRIES"
-
-    ENTRIES="$(echo -ne "$ENTRIES" | sort | uniq)"
-
-    test -z "$ENTRIES" || CHANGES="$CHANGES""$prev_changes_header"'\n'"$ENTRIES"'\n\n'
-
-}
-
 generate_changes () {
 
-  CHANGES=""
-  ENTRIES=""
+  test -f "$SPECFILE" || return
 
-  for tag in $list_of_tags; do
-    tagver=""
+  if test -n "$MANIFEST"; then
+    pushd .repo/manifests >/dev/null
+  fi
 
-    get_tagver_from_tag
+  local ch cD cb ct ci an ae ref oldci oldct=0
+  declare -A chs
+  declare -a revlist
 
-    if is_valid_tagver "$tagver"; then
+  sed -i -e '/%changelog/,$d' "$SPECFILE"
+  echo -e "\n%changelog" >> "$SPECFILE"
 
-      if test -n "$prev_changes_header" -a -n "$prev_valid_tagver"; then
+  while IFS='|' read ct ci an ae ref; do
 
-        tag_sha1="$(git rev-list --max-count=1 --abbrev-commit $tag)"
-        prev_valid_tag_sha1="$(git rev-list --max-count=1 --abbrev-commit $prev_valid_tag)"
-
-        if test "$tag_sha1" = "$prev_valid_tag_sha1"; then
-          # if two tags are pointing at the same sha1 use the previous one (first handled is latest)
-          continue
-        fi
-
-        do_changelog_block
-
-      fi
-
-      changes_header="$(get_changes_header)"
-
-      prev_changes_header="$changes_header"
-      prev_valid_tag=$tag
-      prev_valid_tagver=$tagver
-
+    if [ "$oldct" -gt "$ct" ]; then
+      ct="$oldct"
+      ci="$oldci"
     else
-      tagver=""
-      tag=""
+      oldct="$ct"
+      oldci="$ci"
     fi
+
+    get_versha $ref
+    cD="$(date --date="$ci" '+%a %b %d %Y %H:%I %z')"
+    revlist+=($ref)
+    chs[$ref]="* $cD $an <$ae> - $VERSHA"
+
+  done < <(git log --reverse --date-order HEAD --pretty=tformat:'%ct|%ci|%an|%ae|%H')
+
+  for (( idx=${#revlist[@]}-1 ; idx>=0 ; idx-- )) ; do
+    ref=${revlist[$idx]}
+    echo "${chs[$ref]}" >> "$SPECFILE"
+    git log --no-walk --pretty="%B" $ref | grep -F "$TOKEN" | dash_trim >> "$SPECFILE"
+    echo >> "$SPECFILE"
   done
 
-  # handle the first tag, initial point for the ref range is the parent (root) commit
-  if test -n "$prev_valid_tag"; then
-    tag="$(git rev-list --parents --max-parents=0 $prev_valid_tag)"
-    do_changelog_block
+  if test -n "$MANIFEST"; then
+    popd >/dev/null 
   fi
 
-  if test -z "$CHANGESFILE" ; then
-    CHANGESFILE=../$PACKAGE_NAME.changes
-    OLDCHANGES=""
-  else
-    OLDCHANGES=$(cat "$CHANGESFILE" | sed -e 's/"/\\"/g')
-    CHANGESFILE=../$(basename $CHANGESFILE)
-    rm -f $CHANGESFILE
-  fi
-
-  test -z "$CHANGES" || echo -e "$CHANGES" > "$CHANGESFILE"
-
-  test -z "$OLDCHANGES" || echo -e "$OLDCHANGES" >> "$CHANGESFILE"
-
-  if test -f "$CHANGESFILE" ; then
-
-    SORTEDCHANGES="$(mktemp)"
-    rm -f "$SORTEDCHANGES"
-
-    # old sort version doesn't have version sort
-    if [ "`echo a | sort -k1Vr &> /dev/null; echo $?`" -eq "0" ]; then
-	EXTRA_SORT_OPTIONS="-k1Vr"
-    else
-	EXTRA_SORT_OPTIONS=
-    fi
-
-    # select header lines with their line number then copy the version of each to the beginning of the line
-    # the reason we copy the version is the name can be 1, 2 or 3 words which means the version field number changes
-    # then sort by year , month , day, version
-    SORTED_HEADERS="$(grep -n '\*.* - .*' "$CHANGESFILE" | awk '{print $NF " :"$0}' | sort -k6nr -k4Mr -k5nr $EXTRA_SORT_OPTIONS)"
-
-    if [ ! -z "$SORTED_HEADERS" ]; then
-      # for each header
-      echo -e "$SORTED_HEADERS" | while read header; do
-        # get the header
-        echo "$header" | cut -d ':' -f 3 >> "$SORTEDCHANGES"
-        # get its line number
-        LN=$( echo "$header" | cut -d ':' -f 2)
-        # skip everything upto and including the header line number
-        # also skip the next header and everything after it
-        # and skip empty lines
-        # effectively we select the entries block matching the current header
-        sed -e "1,${LN}d" -e '/^\*.*-.*$/,$d' -e '/^\s*$/d' "$CHANGESFILE" >> "$SORTEDCHANGES"
-        echo "" >> "$SORTEDCHANGES"
-      done
-      cp "$SORTEDCHANGES" "$CHANGESFILE"
-    fi
-
-    rm -f "$SORTEDCHANGES"
-
-  fi
 }
 
 changes_to_debian () {
@@ -662,8 +521,14 @@ changes_to_debian () {
 
 git_ls_files () {
 
+    if test -n "$MANIFEST"; then
+
+      find * -xdev -not -path "*/.git*" -print0 | sort -z
+      return 
+    fi
+
     # generate list of files to include in tarball
-    git ls-files -z --with-tree=$SEMI_TAG | sed -z -e '/^rpm\//d'
+    git ls-files -z --with-tree=HEAD | sed -z -e '/^rpm\//d'
 
     # include submodules in the list
     git submodule --quiet foreach --recursive 'git ls-files -z --with-tree=$sha1 | sed -z -e "s#^#$toplevel/$path/#"' | sed -z -e "s#^$PWD/##"
@@ -677,12 +542,15 @@ cache_prefetch () {
   NAME=$1
   URL=$2
 
+  OLDUMASK=`umask`
+  umask 0000
+
   if [ x"$CACHE_DIR" = "x" ]; then
       return
   fi
 
   if [ ! -d $CACHE_DIR ]; then
-      error "$CACHE_DIR doesn't exist ..."
+      mkdir -p $CACHE_DIR || error "$CACHE_DIR doesn't exist ..."
   fi
 
   SERVER_SUBDIR="$(dirname $URL)"
@@ -692,15 +560,30 @@ cache_prefetch () {
   mkdir -p "$SERVER_DIR"
   CLONE_DIR="$SERVER_DIR/$NAME"
 
-  if [ -d "$CLONE_DIR" ]; then
-    pushd "$CLONE_DIR" >/dev/null
-      flock -w 7200 -x "$CLONE_DIR" git fetch -q --prune --all --force
-    popd >/dev/null
+  if test \! -d "$CLONE_DIR"; then
+      mkdir -p "$CLONE_DIR"
+      pushd "$CLONE_DIR" >/dev/null
+      COMM="git clone -q --config remote.origin.fetch="+refs/changes/*:refs/remotes/changes/*" --mirror "$URL" ."
+      test -n "$MANIFEST" && COMM="repo init --mirror --manifest-url=$MYURL --manifest-branch=$BRANCH --manifest-name=$MANIFEST"
+      flock -w 7200 -x "$CLONE_DIR" $COMM
+      popd >/dev/null
   else
-    mkdir -p "$CLONE_DIR"
-    flock -w 7200 -x "$CLONE_DIR" git clone -q --mirror "$URL" "$CLONE_DIR"
+      pushd "$CLONE_DIR" >/dev/null
+      git config --get-regexp remote.origin.fetch '^\+refs\/changes/\*\:refs\/remotes\/changes\/\*' || git config --add remote.origin.fetch "+refs/changes/*:refs/remotes/changes/*"
+      test -n "$MANIFEST" || flock -w 7200 -x "$CLONE_DIR" git fetch -q --prune --all --force
+      popd >/dev/null
   fi
 
+   if test -n "$MANIFEST"; then
+     pushd "$CLONE_DIR" >/dev/null
+     flock -w 7200 -x "$CLONE_DIR" repo sync --force-broken --optimized-fetch --fetch-submodules --jobs=2
+     popd >/dev/null
+     REPOREF="--reference=$CLONE_DIR"
+     return
+   fi
+
+
+  umask $OLDUMASK
   # override url with the fresh local cache
   URL="$CLONE_DIR"
 }
@@ -708,22 +591,28 @@ cache_prefetch () {
 handle_submodules() {
  
   if [ -f .gitmodules ] ; then
-    local submod url path URL REFERENCE
+    
+    local gitconf submod url ourl path URL REFERENCE
+
+    git submodule sync
     for submod in $(git config -f .gitmodules -l | grep -P 'submodule\..*\.url' | xargs); do
       url=$(echo $submod | cut -d= -f2)
       name=$(echo $submod | cut -d= -f1 | cut -d. -f2)
       path=$(git config -f .gitmodules --get submodule.$name.path | cut -d= -f2)
-    
+      gitconf=".git/modules/$path/config"
+
+      ourl=$url
       URL=$url
       cache_prefetch $name $URL
       url=$URL
     
       REFERENCE=""
       [ -d "$url" ] && REFERENCE="--reference $url"
-    
-      git submodule --quiet update --init --force $REFERENCE -- $path
+      
+      git submodule --quiet update --checkout --init --force $REFERENCE -- $path
+      git config -f $gitconf --get-regexp remote.origin.fetch '^\+refs\/changes/\*\:refs\/remotes\/changes\/\*' || git config -f $gitconf --add remote.origin.fetch "+refs/changes/*:refs/remotes/changes/*"
 
-      test -d $path || error "Something went wrong handling submodule $name from $url"
+      test -d $path || error "Something went wrong handling submodule $name from $ourl"
 
       pushd $path >/dev/null
         handle_submodules
@@ -731,7 +620,6 @@ handle_submodules() {
      
     done
   fi
- 
 }
 
 parse_url () {
@@ -781,6 +669,12 @@ clone () {
   echo "Handling $CLONE_NAME"
   URL=$MYURL
   cache_prefetch $CLONE_NAME $URL
+
+  if test -n "$MANIFEST"; then
+    run_android_repo_service
+    return
+  fi
+
   MYURL=$URL
 
   if [ -d $CLONE_NAME ]; then
@@ -788,29 +682,35 @@ clone () {
       git fetch -q -p
       [ $? -eq 0 ] || error "couldn't update $CLONE_NAME"
       git pull
-      [ $? -eq 0 ] || error "couldn't update $CLONE_NAME"
+      #[ $? -eq 0 ] || error "couldn't update $CLONE_NAME"
     popd >/dev/null
   else
-    git clone -q "$MYURL" "$CLONE_NAME"
+    git clone --config remote.origin.fetch="+refs/changes/*:refs/remotes/changes/*" -q "$MYURL" "$CLONE_NAME"
     [ $? -eq 0 ] || error "couldn't clone $CLONE_NAME"
+    git --git-dir="$CLONE_NAME"/.git fetch -q --prune --all --force
   fi
 
   pushd $CLONE_NAME >/dev/null
-  if [ ! -z "$BRANCH" ] ; then
-      git checkout "$BRANCH"
-      [ $? -eq 0 ] || error "couldn't checkout branch $BRANCH"
-  else
-      BRANCH="$(git branch | grep '*' | gawk '{ print $2 }')"
-  fi
-
-  if [ ! -z "$REVISION" ] ; then
-      git reset --hard "$REVISION"
-      [ $? -eq 0 ] || error "couldn't checkout revision $REVISION"
-  fi
 
   # initialize submodules if any
   handle_submodules
-  git submodule update --recursive --init --force
+
+  if [ ! -z "$BRANCH" ] ; then
+      git fetch origin "$BRANCH" && git checkout -f FETCH_HEAD
+      [ $? -eq 0 ] || error "couldn't checkout branch $BRANCH"
+  fi
+
+  if [ ! -z "$REVISION" ] ; then
+      git checkout --detach "$REVISION"
+      [ $? -eq 0 ] || error "couldn't checkout revision $REVISION"
+  fi
+
+  if [ -z "$BRANCH" ]; then
+      BRANCH="$(git branch | grep '*' | gawk '{ print $2 }' | sed -e 's/(//')"
+  fi
+
+  #git submodule update --recursive --checkout --init --force
+  handle_submodules
 
   popd >/dev/null
 }
@@ -818,120 +718,168 @@ clone () {
 
 set_versha () {
 
-  VERSION=""
-  VERSION_FULLTAG=""
-  RELEASE=""
+  if test -n "$VERSHASET"; then
+    return
+  fi
 
-  # determine version from latest tag in reverse date sorted list of tags that looks like a version
-  find_version_tag
+  if test -n "$MANIFEST"; then
+    pushd .repo/manifests >/dev/null
+  fi
+
+  declare -g -A vershas
+  local count=0 tagver="0.0" nref="" default_ref our_ref ref merge_base
+  default_ref="$(git name-rev --name-only --no-undefined --always origin/HEAD 2>/dev/null)"
+  test -z "$default_ref" && default_ref="$(git name-rev --name-only --no-undefined --always $(git ls-remote origin HEAD | cut -f1))"
+  our_ref="$(git name-rev --name-only --no-undefined --always HEAD 2>/dev/null)"
+  ref="$default_ref"
+  merge_base="$(git rev-parse --short $(git merge-base $default_ref HEAD))"
   
-  if [ "x$VERSION" = "x" ]; then 
-    # none found, fallback to using version from spec file
-    find_version "$SPECFILE"
-  fi
-
-  # decide if we need to add a git revision to the version
-  # if the version is already the current revision's tag then no (release tag)
-  # otherwise add ".git<short rev>"
-
-  # get a tag that describes the current revision.
-  # if none are found --always returns a uniquely abbreviated commit object as fallback
-  SEMI_TAG=$(git describe --tags --always)
-  TAG_NAME="$SEMI_TAG"
-
-  if [ "x$TAG_NAME" = "x$VERSION_FULLTAG" ] ; then
-    # same as the version's tag, don't need to append anything
-    SHA=""
-  else
-
-    # find closest possible tag
-    CLOSEST_TAG=$(git describe --tags --abbrev=0 --always)
-    # if closest tag is same as the full description then we are at the tag
-    # in that case use the tag's sha1sum 
-    #FIXME: prepend number of commits from the closest version tag if possible
-    if [ "x$CLOSEST_TAG" = "x$TAG_NAME" ]; then
-      # Guard against multiple tags of the same commit. git uses the "closest" tag it finds and in our
-      # case it is not what we want since it might be completely different from the version tag we selected
-      # therefore consider using the version full tag if their revisions are equivalent
-      if [ ! -z "$VERSION_FULLTAG" ]; then
-        version_fulltag_sha1sum=".$(git rev-list --max-count=1 --abbrev-commit $VERSION_FULLTAG)"
+  while IFS="|" read rev ps decs; do
+    count="$((count+1))"
+    decs="${decs// /}"
+    decs="${decs#(}"
+    decs="${decs%)}"
+    # if one of this rev's parents was the merge-base then we've left the default ref
+    # unset ref to look for alternate ref name
+    for p in $ps; do
+      test "$p" = "$merge_base" && ref=""
+    done
+  
+    for dec in ${decs//,/ }; do
+      case "$dec" in
+        tag:*)
+          tag="$(get_tagver "${dec#tag:}")"
+          if is_valid_tagver "$tag" ; then
+            tagver="$tag"
+            count=0
+          fi
+        ;;
+        changes/*)
+          test -z "$ref" && nref="${dec//[\/-]/.}"
+        ;;
+      esac
+    done
+  
+    # check if there is a better name than a possible changes/ 
+    if test -z "$ref"; then
+      pnref="$(git name-rev --name-only --no-undefined --always --refs='origin/*' "$rev")"
+      if test "$pnref" != "$rev"; then
+        pnref="${pnref#origin/}"
+        pnref="${pnref%%~*}"
+        nref="${pnref//[\/-]/.}"
       fi
-      sha1sum=".$(git rev-list --max-count=1 --abbrev-commit $TAG_NAME)"
-
-      if [ "x$version_fulltag_sha1sum" = "x$sha1sum" ]; then
-          SHA=""
-      else
-        nbranch="$(echo $BRANCH | sed -e 's/-/\./g')"
-        #count=".$(git rev-list --abbrev-commit $TAG_NAME | wc -l)"
-        # https://fedoraproject.org/wiki/Packaging:NamingGuidelines#Snapshot_packages
-        # Use YYYYMMDDHHMMSS timestamps which work better in cases or rebasing
-        ts=".$(date --date=@$(git log --max-count=1 --pretty=%ct) +%Y%m%d%H%M%S)"
-        SHA="+$nbranch$ts$sha1sum"
-      fi
-    else
-      # use the unique abbreviation part as it is usually incremental
-      # in something like foobar-3-g54ab00b replace - with dot to make a legal rpm version
-      sha1sum=$(echo $TAG_NAME | sed -e "s#$CLOSEST_TAG##" -e "s/-/\./g" -e 's#/#.#g' -e 's#^#\.#' -e 's#^\.\.#.#')
-      nbranch=$(echo $BRANCH | sed -e 's/-/\./g' -e 's#/#.#g')
-      #count=".$(git rev-list --abbrev-commit $BRANCH | wc -l)"
-      ts=".$(date --date=@$(git log --max-count=1 --pretty=%ct) +%Y%m%d%H%M%S)"
-      # get and append the short revision of the this most recent tag
-      SHA="+$nbranch$ts$sha1sum"
+      # fallback if we don't have a name yet
+      test -z "$nref" && nref="detached"
     fi
+  
+    ref="${ref#remotes/origin/}"
+    ref="${ref%%~*}"
+    ref="${ref//[\/-]/.}"
 
+    vershas[$rev]="$tagver.$count+${ref}${nref}.$rev"
+  done < <(git log --reverse --decorate=short --pretty=tformat:'%h|%p|%d' --topo-order HEAD)
+
+  VERSHASET="YES"
+
+  if test -n "$MANIFEST"; then
+    popd >/dev/null 
   fi
- 
-  # concat version and sha 
-  VERSHA="$VERSION$SHA"
+}
+
+get_versha () {
+
+  local ref="$1"
+  SHORTREV="$(git rev-parse --short $ref)"
+  VERSHA="${vershas[$SHORTREV]}"
+  VERSION="${VERSHA%.*+*}"
+  COUNT="${VERSHA%+*}"
+  COUNT="${COUNT#${VERSION}.}"
 
 }
 
 set_spec_version () {
+
+  [[ -z "$SPECFILE" ]] && return
   # add matching version to the spec file
-  sed -i -e "s/^Version:.*$/Version:    $VERSHA/g" ../$(basename $SPECFILE)
+  sed -i -e "s/^Version:.*$/Version:    $VERSHA/g" $SPECFILE
+
+  sed -i -e "s/@MAJOR@/$VERSION/" $SPECFILE
+  sed -i -e "s/@MINOR@/$COUNT/" $SPECFILE
+  sed -i -e "s/@REV@/$SHORTREV/" $SPECFILE
 
   if [ ! "x$RELEASE" = "x" ]; then
-    sed -i -e "s/^Release:.*$/Release:    $RELEASE/g" ../$(basename $SPECFILE)
+    sed -i -e "s/^Release:.*$/Release:    $RELEASE/g" $SPECFILE
     SPECRELEASE=$RELEASE
   fi
 }
 
 rpm_pkg () {
+  if test -n "$MANIFEST"; then
+    pushd .repo/manifests >/dev/null
+  fi
 
-  find_spec_file rpm
+  find_spec_file
   expand_spec_file "$SPECFILE"
-  cp -v "$SPECFILE" ..
-  find_changes_file rpm
-  find_yaml_file
-  find_other_files
   find_compression "$SPECFILE"
   find_package_name "$SPECFILE"
   echo "package name is $PACKAGE_NAME"
+  #find_changes_file
+  find_other_files
 
-  set_versha
+  get_versha HEAD
 
+  if test -n "$MANIFEST"; then
+    popd >/dev/null 
+  fi
+
+  set_spec_version
   # add tarball version file for some packages that use auto foo
   if [ -f git-version-gen ] || [ -f build-aux/git-version-gen ]; then
      echo -n $VERSHA > .tarball-version
   fi
 
-  git_ls_files | tar --mtime '2000-01-01' --null --no-recursion -c --transform "s#^#$PACKAGE_NAME-$VERSHA/#S" -T - | $COMPRESS_COMMAND > $MYOUTDIR/$PACKAGE_NAME-$VERSHA.$COMPRESS_EXT
+  #tar --mtime '2000-01-01'
+  git_ls_files | tar --null --no-recursion -c --transform "s#^#$PACKAGE_NAME-$VERSHA/#S" -T - | $COMPRESS_COMMAND > $MYOUTDIR/$PACKAGE_NAME-$VERSHA.$COMPRESS_EXT
 
-  set_spec_version
-
+  git diff-tree --root --no-commit-id --name-only -r HEAD > $MYOUTDIR/$PACKAGE_NAME-$VERSHA.changed_files
 }
 
 run_android_repo_service () {
-  REPOCMD="/usr/lib/obs/service/repo --initrepo "$REPO_PATH"/"$REPO_NAME" --service "$SVC_NAME" --branch "$BRANCH" --outdir "$MYOUTDIR""
-  test -f tagged-manifest.xml && REPOCMD="$REPOCMD --manifest-name tagged-manifest.xml"
-  test -x /usr/lib/obs/service/repo || error "repo service script not found at /usr/lib/obs/service/repo"
-  $REPOCMD
-  find_spec_file "$MYOUTDIR"
-  find_changes_file "$MYOUTDIR"
-  find_package_name "$SPECFILE"
-  echo "package name is $PACKAGE_NAME"
-  set_versha
-  set_spec_version
+
+  local REV PRJN BR CHPA RC
+  set -e 
+  mkdir -p $CLONE_NAME
+  pushd $CLONE_NAME >/dev/null
+
+  repo init --manifest-url=$MYURL --manifest-branch=$BRANCH --manifest-name=$MANIFEST $REPOREF || :
+  cd .repo/manifests
+      git fetch origin "+refs/changes/*:refs/remotes/changes/*"
+      REVISION="$(git rev-parse $REVISION)"
+  cd ../..
+  repo init --manifest-branch=$REVISION --manifest-name=$MANIFEST
+  repo sync --force-broken --optimized-fetch --fetch-submodules --jobs=2
+
+  for pin in $PINS; do
+    PRJN="$(echo $pin | cut -d":" -f1)"
+    if test -n "$(repo list -n | grep -w $PRJN)" ; then
+      BR="$(echo $pin | cut -d":" -f2)"
+      RC="$(echo $BR | cut -d"/" -f1,2)"
+      if test "$RC" == "refs/changes"; then
+        CHPA="$(echo $BR | cut -d"/" -f4,5)"
+      fi
+      REV="$(echo $pin | cut -d":" -f3)"
+      REMOTES="$(repo forall $PRJN -c git remote -v | grep fetch | gawk '{ print $1 }' | xargs)"
+      for r in $REMOTES; do
+          repo forall $PRJN -c git fetch $r "+refs/changes/*:refs/remotes/changes/*" || :
+      done
+      repo forall $PRJN -c git checkout $REV
+    fi
+  done
+
+  repo manifest --revision-as-HEAD --output-file=$MYOUTDIR/$MANIFEST
+
+  popd >/dev/null
+  set +e
 }
 
 download_files () {
@@ -1053,7 +1001,7 @@ try_debian_packaging() {
   fi
   mv "debian/changelog.git" "debian/changelog"
 
-  dpkg-source --format="3.0 (quilt)" -I -b "$CLONE_NAME"
+  dpkg-source --format="3.0 (quilt)" -I -b .
 }
 
 source_checks () {
@@ -1076,6 +1024,93 @@ since last tagged version. example: [anything] foo bar'
 
 }
 
+try_bitbake () {
+  set -e
+  local REV PKGN BR oe CHPA RC
+
+  mkdir -p build/conf
+  test -d "$CACHE_DIR_YOCTO/cache" || mkdir -p "$CACHE_DIR_YOCTO/cache"
+  test -f "$SITE_CONF_YOCTO" && cp "$SITE_CONF_YOCTO" build/conf/site.conf
+  cat <<EOF >> build/conf/auto.conf
+INHERIT += "buildhistory"
+BUILDHISTORY_COMMIT = "1"
+DL_DIR = "$CACHE_DIR_YOCTO/download"
+SSTATE_DIR = "$CACHE_DIR_YOCTO/sstate"
+FILESEXTRAPATHS_append = ":${TOPDIR}/conf"
+INHERIT += "rm_work"
+PERSISTENT_DIR = "$MYOUTDIR"
+BB_GENERATE_MIRROR_TARBALLS = "1"
+EOF
+
+
+  cp "$MYOUTDIR"/*.diff "$MYOUTDIR"/*.patch build/conf/ || :
+  #cp "$MYOUTDIR"/*.diff "$MYOUTDIR"/*.patch "$MYOUTDIR"/*.py "$MYOUTDIR"/run-ptest build/conf/ || :
+
+  #if test -e "$MYOUTDIR"/layer.conf; then
+  #  mkdir -p local/conf
+  #  cp "$MYOUTDIR"/layer.conf local/conf/
+  #  cp "$MYOUTDIR"/*.bb "$MYOUTDIR"/*.inc "$MYOUTDIR"/*.bbappend "$MYOUTDIR"/*.bbclass local/ || :
+
+  #  echo 'BBLAYERS += " ${TOPDIR}/../local "' >> build/conf/bblayers.conf
+  #fi
+  #layertars=$(ls -1 "$MYOUTDIR"/layer-*.tar.* 2>/dev/null | wc -l)
+  #if test "$layertars" -ge "1"; then
+  #  mkdir -p local/
+  #  tar -xvf "$MYOUTDIR"/layer-*.tar.* -C local/
+  #  for layer in local/*; do
+  #    if test -d $layer; then
+  #        echo "BBLAYERS += \" \${TOPDIR}/../${layer} \"" >> build/conf/bblayers.conf
+  #    fi
+  #  done
+  #  cat build/conf/bblayers.conf
+  #fi
+
+  if test -e "$MYOUTDIR"/bblayers.conf; then
+    cp "$MYOUTDIR"/bblayers.conf "$MYOUTDIR"/local.conf build/conf/
+    oe="$(find -path '*poky*' -name oe-init-build-env)"
+    . $oe `pwd`/build
+  elif test -e setup-environment; then
+    EULA=1 DISTRO=$DISTRO MACHINE=$MACHINE source ./setup-environment build
+    test -f setup-environment && EULA=1 DISTRO=$DISTRO MACHINE=$MACHINE source ./setup-environment build
+  else
+    echo "Need either bblayers.conf or setup-environment for bitbake"
+  fi
+
+  for pin in $PINS; do
+    PKGN="$(echo $pin | cut -d":" -f1)"
+    BR="$(echo $pin | cut -d":" -f2)"
+    RC="$(echo $BR | cut -d"/" -f1,2)"
+    if test "$RC" == "refs/changes"; then
+        CHPA="$(echo $BR | cut -d"/" -f4,5)"
+        echo "GERRIT_pn-${PKGN} = \"$CHPA\"" >> conf/gerrit.conf
+    fi
+    REV="$(echo $pin | cut -d":" -f3)"
+    echo "SRCREV_pn-${PKGN}_forcevariable = \"$REV\"" >> conf/local.conf
+    echo "SRCBRANCH_pn-${PKGN}_forcevariable = \"$BR\"" >> conf/local.conf
+
+  done
+
+  echo 'PACKAGE_CLASSES = "package_ipk"' >> conf/local.conf
+  echo 'EXTRA_IMAGE_FEATURES += "package-management"' >> conf/local.conf
+
+  cat conf/local.conf
+  cat conf/auto.conf || :
+  cat conf/site.conf || :
+  cat conf/gerrit.conf || :
+  touch conf/sanity.conf
+
+  OLDUMASK=`umask`
+  umask 0000
+  mkdir -p "$CACHE_DIR_YOCTO/download" "$CACHE_DIR_YOCTO/sstate" "$CACHE_DIR_YOCTO/ccache" "$CACHE_DIR_YOCTO/cache"
+  #flock -w 7200 -x "$CACHE_DIR_YOCTO" 
+  #MACHINE=$MACHINE DISTRO=$DISTRO bitbake -c fetchall $BITBAKE buildtools-tarball virtual/nativesdk-libsdl nativesdk-packagegroup-sdk-host packagegroup-qt5-toolchain-target
+  MACHINE=$MACHINE DISTRO=$DISTRO bitbake -c fetchall --continue universe || :
+  umask $OLDUMASK
+
+  buildhistory-collect-srcrevs -f >> conf/local.conf
+  cp conf/bblayers.conf conf/local.conf conf/gerrit.conf conf/site.conf "$MYOUTDIR"/ || :
+  set +e
+}
 
 main () {
   set_default_params
@@ -1092,15 +1127,14 @@ main () {
     return
   fi
   pushd "$CLONE_NAME" >/dev/null
-  # check for default manifest file
-  if test -f default.xml; then
-    run_android_repo_service
-  else
-    rpm_pkg
-  fi
+  set_versha
+  rpm_pkg
   generate_changes
   download_files
   try_debian_packaging
+  if test -n "$BITBAKE"; then
+    try_bitbake
+  fi
   source_checks
   popd >/dev/null
 }
