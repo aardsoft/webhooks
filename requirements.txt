@@ -1,6 +1,11 @@
 # still incomplete
+django<2;
 django-extensions
 django-celery
 djangorestframework
 djangorestframework-filters
 pika
+pygerrit
+PyYAML
+pycurl
+celery [gevent]
