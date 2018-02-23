@@ -28,18 +28,11 @@ from django.conf import settings
 from webhook_launcher.app.models import (LastSeenRevision, WebHookMapping, 
                                          BuildService, Project, VCSService,
                                          VCSNameSpace, QueuePeriod,
-                                         RelayTarget, Mirror)
+                                         RelayTarget, Mirror, SlavesThrough)
 
 from webhook_launcher.app.tasks import trigger_build, trigger_mirror
 from webhook_launcher.app.misc import get_or_none
 from webhook_launcher.app.payload import get_payload
-
-class SlavesThrough(WebHookMapping.slaves.through):
-    class Meta:
-        proxy = True
-
-    def __unicode__(self):
-        return ""
 
 class MirrorsInline(admin.StackedInline):
     model = Mirror

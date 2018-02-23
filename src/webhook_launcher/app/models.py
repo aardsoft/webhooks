@@ -248,6 +248,14 @@ class WebHookMapping(models.Model):
     comment = models.TextField(blank=True, null=True, default="")
     user = models.ForeignKey(User, editable=False)
 
+class SlavesThrough(WebHookMapping.slaves.through):
+    class Meta:
+        proxy = True
+        auto_created = True
+
+    def __unicode__(self):
+        return ""
+
 class LastSeenRevision(models.Model):
 
     def __unicode__(self):
